@@ -1,0 +1,278 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+import warnings
+import os
+import itertools
+import argparse
+from typing import List, Tuple, Dict, Any
+
+# Ignore non-critical mathematical warnings during curve fitting
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# CONFIGURATION BLOCK
+# Modify these variables for different experiments
+# ==========================================
+CONFIG = {
+    "input_file": "il6_data.xlsx",         # Default input file
+    "output_dir": "ELISA_Results",         # Directory to save plots and excel
+    "sheet_index": 0,
+    "std_concentrations": [10.0, 5.0, 2.5, 1.25, 0.625, 0.3125, 0.15625],
+    "dilution_factor": 20,
+    "max_acceptable_cv": 15.0,             # Threshold for smart QC filter
+    
+    # Plate Layout Coordinates (Row/Col indices in pandas are 0-indexed)
+    # Adjust these based on how your spectrophotometer exports the data
+    "abs_450_range": (9, 17, 1, 13),       # (start_row, end_row, start_col, end_col)
+    "abs_540_range": (23, 31, 1, 13),
+    "blank_coords": (7, 0, 3),             # (row_index, start_col, end_col)
+    
+    # Sample names mapped to their column blocks
+    # Format: (start_col, end_col, block_name, [sample_names])
+    "sample_blocks": [
+        (3, 6, '4-6', ["13", "14", "15 t1", "15 t2", "16", "17 t1", "17 t2", "18"]),
+        (6, 9, '7-9', ["19 t1", "19 t2", "20 t1", "20 t2", "21 t1", "21 t2", "22", "23 t1"]),
+        (9, 12, '10-12', ["23 t2", "24", "25", "26", "27", "28", "29", "Pool"])
+    ]
+}
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+
+def model_4pl(x: float, a: float, b: float, c: float, d: float) -> float:
+    """Four-Parameter Logistic (4PL) regression model."""
+    return d + (a - d) / (1.0 + (x / c)**b)
+
+def inverse_4pl(y: float, a: float, b: float, c: float, d: float) -> float:
+    """Calculates concentration (x) given absorbance (y) using the 4PL model."""
+    y_clip = np.clip(y, min(d, a) + 1e-6, max(d, a) - 1e-6)
+    return c * ((a - y_clip) / (y_clip - d))**(1 / b)
+
+def calculate_cv(values: np.ndarray) -> float:
+    """Calculates the Coefficient of Variation (%) for a given array."""
+    mean_val = np.mean(values)
+    if mean_val == 0:
+        return 0.0
+    return (np.std(values, ddof=1) / mean_val) * 100
+
+def smart_qc_filter(replicates: np.ndarray, max_cv: float) -> Tuple[np.ndarray, List[int], str]:
+    """
+    Evaluates a triplicate. If CV > max_cv, it drops the outlier and returns 
+    the best duplicate to salvage the measurement.
+    """
+    initial_cv = calculate_cv(replicates)
+    
+    if initial_cv <= max_cv:
+        return replicates, [0, 1, 2], "Triplicate"
+        
+    # Rescue operation: find the best pair
+    min_cv = float('inf')
+    best_indices = [0, 1]
+    
+    for idxs in itertools.combinations([0, 1, 2], 2):
+        pair = [replicates[k] for k in idxs]
+        cv = calculate_cv(pair)
+        if cv < min_cv:
+            min_cv = cv
+            best_indices = list(idxs)
+            
+    best_replicates = np.array([replicates[k] for k in best_indices])
+    return best_replicates, best_indices, "Optimal Duplicate"
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+def main(input_path: str):
+    print(f"[*] Loading data from: {input_path}")
+    
+    try:
+        df = pd.read_excel(input_path, sheet_name=CONFIG["sheet_index"])
+    except FileNotFoundError:
+        print(f"[!] Error: File '{input_path}' not found. Please check the path.")
+        return
+
+    # Extract raw data based on config coordinates
+    r1, r2, c1, c2 = CONFIG["abs_450_range"]
+    abs_450 = df.iloc[r1:r2, c1:c2].astype(float).values
+    
+    r1, r2, c1, c2 = CONFIG["abs_540_range"]
+    abs_540 = df.iloc[r1:r2, c1:c2].astype(float).values
+
+    # Background correction
+    abs_corr = abs_450 - abs_540
+    blank_row, b_col1, b_col2 = CONFIG["blank_coords"]
+    blank_mean = np.mean(abs_corr[blank_row, b_col1:b_col2]) 
+    abs_net = abs_corr - blank_mean
+
+    # 1. Process Standards & Build 4PL Model
+    print("[*] Processing standards and fitting 4PL model...")
+    x_stds, y_stds = [], []
+    std_qc_data = [] 
+
+    for i, conc in enumerate(CONFIG["std_concentrations"]):
+        raw_triplicate = abs_net[i, 0:3]
+        valid_replicates, used_indices, well_type = smart_qc_filter(raw_triplicate, CONFIG["max_acceptable_cv"])
+        
+        for val in valid_replicates:
+            x_stds.append(conc)
+            y_stds.append(val)
+            
+        std_qc_data.append({
+            "Theoretical_pgmL": conc,
+            "Mean_Abs": np.mean(valid_replicates),
+            "CV_perc": calculate_cv(valid_replicates),
+            "Format": well_type,
+            "Used_Indices": used_indices
+        })
+
+    x_stds = np.array(x_stds)
+    y_stds = np.array(y_stds)
+
+    # Fit 4PL curve
+    initial_guesses = [max(y_stds), 1.0, np.median(x_stds), min(y_stds)]
+    popt, _ = curve_fit(model_4pl, x_stds, y_stds, p0=initial_guesses, maxfev=10000)
+    
+    y_pred = model_4pl(x_stds, *popt)
+    r_squared = 1 - (np.sum((y_stds - y_pred)**2) / np.sum((y_stds - np.mean(y_stds))**2))
+
+    # 2. Process All Wells (Standards, Blanks, Samples)
+    print("[*] Calculating concentrations for all samples...")
+    global_results = []
+    rows_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+
+    # Standards to results
+    for i, std in enumerate(std_qc_data):
+        interp_conc = max(0, inverse_4pl(std["Mean_Abs"], *popt))
+        idx = std["Used_Indices"]
+        
+        global_results.append({
+            "ID": f"Standard {i+1} ({std['Theoretical_pgmL']} pg/mL) [{std['Format']}]",
+            "Wells": f"{rows_labels[i]} 1-3",
+            "Net_Absorbance": round(std["Mean_Abs"], 4),
+            "CV (%)": round(std["CV_perc"], 2),
+            "Interpolated_IL6 (pg/mL)": round(interp_conc, 3),
+            "Final_Diluted_IL6 (pg/mL)": "-" 
+        })
+
+    # Blank to results
+    blank_cv = calculate_cv(abs_corr[blank_row, b_col1:b_col2])
+    global_results.append({
+        "ID": "Blank (0 pg/mL) [Triplicate]",
+        "Wells": f"{rows_labels[blank_row]} 1-3",
+        "Net_Absorbance": round(np.mean(abs_net[blank_row, b_col1:b_col2]), 4),
+        "CV (%)": round(blank_cv, 2),
+        "Interpolated_IL6 (pg/mL)": 0.00,
+        "Final_Diluted_IL6 (pg/mL)": "-"
+    })
+
+    # Samples to results
+    for col_start, col_end, cols_name, sample_names in CONFIG["sample_blocks"]:
+        for f, sample_name in enumerate(sample_names):
+            raw_triplicate = abs_net[f, col_start:col_end]
+            mean_net = np.mean(raw_triplicate)
+            cv_perc = calculate_cv(raw_triplicate)
+            
+            interp_conc = max(0, inverse_4pl(mean_net, *popt))
+            final_conc = interp_conc * CONFIG["dilution_factor"]
+            
+            global_results.append({
+                "ID": sample_name,
+                "Wells": f"{rows_labels[f]} {cols_name}",
+                "Net_Absorbance": round(mean_net, 4),
+                "CV (%)": round(cv_perc, 2),
+                "Interpolated_IL6 (pg/mL)": round(interp_conc, 3),
+                "Final_Diluted_IL6 (pg/mL)": round(final_conc, 2)
+            })
+
+    df_final = pd.DataFrame(global_results)
+
+    # 3. Paired Analysis (t1 vs t2)
+    paired_data = {}
+    for res in global_results:
+        sample_id = str(res["ID"])
+        if "t1" in sample_id:
+            patient = sample_id.replace(" t1", "")
+            if patient not in paired_data: paired_data[patient] = {}
+            paired_data[patient]["t1"] = res["Final_Diluted_IL6 (pg/mL)"]
+        elif "t2" in sample_id:
+            patient = sample_id.replace(" t2", "")
+            if patient not in paired_data: paired_data[patient] = {}
+            paired_data[patient]["t2"] = res["Final_Diluted_IL6 (pg/mL)"]
+
+    comparative_results = []
+    for patient, values in paired_data.items():
+        if "t1" in values and "t2" in values:
+            v_t1, v_t2 = values["t1"], values["t2"]
+            diff = v_t2 - v_t1
+            perc_change = ((v_t2 - v_t1) / v_t1) * 100 if v_t1 > 0 else 0
+            
+            comparative_results.append({
+                "Patient ID": patient,
+                "IL-6 Time 1 (pg/mL)": round(v_t1, 2),
+                "IL-6 Time 2 (pg/mL)": round(v_t2, 2),
+                "Absolute Diff (pg/mL)": round(diff, 2),
+                "Change (%)": round(perc_change, 2)
+            })
+
+    df_comparative = pd.DataFrame(comparative_results)
+
+    # 4. Generate Output Files
+    print("[*] Generating visualizations and exporting data...")
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+
+    # Plot 1: 4PL Curve
+    plt.figure(figsize=(10, 7))
+    x_smooth = np.logspace(np.log10(min(CONFIG["std_concentrations"])*0.8), 
+                           np.log10(max(CONFIG["std_concentrations"])*1.2), 500)
+    
+    plt.plot(x_smooth, model_4pl(x_smooth, *popt), '-', color='#1f77b4', 
+             linewidth=2, label=f'4PL Model ($R^2$ = {r_squared:.4f})')
+
+    x_opt, y_opt, x_trip, y_trip = [], [], [], []
+    for d in std_qc_data:
+        if "Optimal" in d["Format"]:
+            x_opt.append(d["Theoretical_pgmL"])
+            y_opt.append(d["Mean_Abs"])
+        else:
+            x_trip.append(d["Theoretical_pgmL"])
+            y_trip.append(d["Mean_Abs"])
+
+    if x_opt:
+        plt.scatter(x_opt, y_opt, color='#ff7f0e', s=80, edgecolor='black', zorder=6, label='Standards (Optimal Duplicate)')
+    if x_trip:
+        plt.scatter(x_trip, y_trip, color='#d62728', s=60, edgecolor='black', zorder=5, label='Standards (Triplicate)')
+
+    x_samples = [res["Interpolated_IL6 (pg/mL)"] for res in global_results if "Standard" not in res["ID"] and "Blank" not in res["ID"]]
+    y_samples = [res["Net_Absorbance"] for res in global_results if "Standard" not in res["ID"] and "Blank" not in res["ID"]]
+    plt.scatter(x_samples, y_samples, color='#2ca02c', marker='o', s=45, alpha=0.8, zorder=4, label='Patient Samples')
+
+    plt.xscale('log')
+    plt.xlabel("IL-6 Concentration (pg/mL)")
+    plt.ylabel("Net Absorbance (OD 450-540nm)")
+    plt.title("IL-6 Calibration Curve - 4PL Regression")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.savefig(os.path.join(CONFIG["output_dir"], "IL6_Calibration_Curve.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Export to Excel
+    excel_path = os.path.join(CONFIG["output_dir"], "IL6_Analysis_Results.xlsx")
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df_final.to_excel(writer, sheet_name='Curve_and_Results', index=False)
+        if not df_comparative.empty:
+            df_comparative.to_excel(writer, sheet_name='Paired_Analysis_t1_t2', index=False)
+
+    print(f"\n[+] Processing complete! Results saved in: '{CONFIG['output_dir']}' directory.")
+
+if __name__ == "__main__":
+    # Allows running the script from terminal passing the excel file as an argument
+    parser = argparse.ArgumentParser(description="ELISA 4PL Analysis Pipeline")
+    parser.add_argument("--input", type=str, default=CONFIG["input_file"], 
+                        help="Path to the raw Excel data file.")
+    args = parser.parse_args()
+    
+    main(args.input)
