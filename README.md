@@ -15,4 +15,5 @@ This script requires Python 3.x and the following standard scientific libraries:
         How to Use
 - Clone the repository to your local machine.
 - Open elisa_4pl_analysis.py and modify the CONFIG block at the top of the script to match your specific plate layout and standard concentrations.
-- Run the script from your terminal:
+- Run the script from your terminal: python elisa_4pl_analysis.py --input "your_raw_data.xlsx"
+- The script will automatically generate a new directory containing the plotted .png graphs and a clean .xlsx report with all interpolated concentrations and paired analysis results.
